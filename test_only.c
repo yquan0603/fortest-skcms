@@ -9,11 +9,34 @@
     #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include "skcms.h"
-#include "skcms_internal.h"
+#include "src/skcms_public.h"
+#include "src/skcms_internals.h"
 #include "test_only.h"
 #include <stdlib.h>
 #include <string.h>
+
+static void print_shortest_float(FILE* fp, float x) {
+    char buf[80];
+    int digits;
+    for (digits = 0; digits < 12; digits++) {
+        snprintf(buf, sizeof(buf), "%.*f", digits, x);
+        float back;
+        if (1 != sscanf(buf, "%f", &back) || back == x) {
+            break;
+        }
+    }
+
+    // We've found the smallest number of digits that roundtrips our float.
+    // That'd be the ideal thing to print, but sadly fprintf() rounding is
+    // implementation specific, so results vary in the last digit.
+    //
+    // So we'll print out one _extra_ digit, then chop that off.
+    //
+    // (0x1.7p-6 == 0x3cb80000 is a good number to test this sort of thing with.)
+
+    int chars = snprintf(buf, sizeof(buf), "%.*f", digits+1, x);
+    fprintf(fp, "%.*s", chars-1, buf);
+}
 
 static void dump_transform_to_XYZD50(FILE* fp,
                                      const skcms_ICCProfile* profile) {
@@ -25,29 +48,51 @@ static void dump_transform_to_XYZD50(FILE* fp,
         npixels = 63;
     }
 
-    uint8_t dst[252];
+    float xyz[252];
 
     if (!skcms_Transform(
                 skcms_252_random_bytes,    fmt, skcms_AlphaFormat_Unpremul, profile,
-                dst, skcms_PixelFormat_RGB_888, skcms_AlphaFormat_Unpremul, skcms_XYZD50_profile(),
+                xyz, skcms_PixelFormat_RGB_fff, skcms_AlphaFormat_Unpremul, skcms_XYZD50_profile(),
                 npixels)) {
         fprintf(fp, "We can parse this profile, but not transform it to XYZD50!\n");
         return;
     }
 
-    fprintf(fp, "252 random bytes transformed to linear XYZD50 bytes:\n");
-    // 252 = 3 * 3 * 7 * 4, so we will print either 9 or 12 rows of 7 XYZ values here.
-    for (size_t i = 0; i < npixels; i += 7) {
-        fprintf(fp, "\t"
-                    "%02x%02x%02x %02x%02x%02x %02x%02x%02x %02x%02x%02x "
-                    "%02x%02x%02x %02x%02x%02x %02x%02x%02x\n",
-                dst[3*i+ 0], dst[3*i+ 1], dst[3*i+ 2],
-                dst[3*i+ 3], dst[3*i+ 4], dst[3*i+ 5],
-                dst[3*i+ 6], dst[3*i+ 7], dst[3*i+ 8],
-                dst[3*i+ 9], dst[3*i+10], dst[3*i+11],
-                dst[3*i+12], dst[3*i+13], dst[3*i+14],
-                dst[3*i+15], dst[3*i+16], dst[3*i+17],
-                dst[3*i+18], dst[3*i+19], dst[3*i+20]);
+    fprintf(fp, "252 random bytes transformed to %zu linear XYZD50 pixels:", npixels);
+    for (size_t i = 0; i < npixels; i++) {
+        if (i % 4 == 0) { fprintf(fp, "\n"); }
+        fprintf(fp, "    % .2f % .2f % .2f", xyz[3*i+0], xyz[3*i+1], xyz[3*i+2]);
+    }
+    fprintf(fp, "\n");
+
+    skcms_ICCProfile dstProfile = *profile;
+    if (skcms_MakeUsableAsDestination(&dstProfile)) {
+        uint8_t back[252];
+
+        if (!skcms_Transform(
+                xyz, skcms_PixelFormat_RGB_fff, skcms_AlphaFormat_Unpremul, skcms_XYZD50_profile(),
+                back,                      fmt, skcms_AlphaFormat_Unpremul, &dstProfile,
+                npixels)) {
+            fprintf(fp, "skcms_MakeUsableAsDestination() was true but skcms_Transform() failed!\n");
+            return;
+        }
+
+        int max_err = 0;
+        for (int i = 0; i < 252; i++) {
+            int err = abs((int)back[i] - (int)skcms_252_random_bytes[i]);
+            if (max_err < err) {
+                max_err = err;
+            }
+        }
+
+        fprintf(fp, "%d max error transforming back from XYZ:", max_err);
+        for (int i = 0; i < 252; i++) {
+            if (i % 21 == 0) { fprintf(fp, "\n   "); }
+            int err = abs((int)back[i] - (int)skcms_252_random_bytes[i]);
+            fprintf(fp, " %3d", err);
+        }
+        fprintf(fp, "\n");
+
     }
 }
 
@@ -115,6 +160,8 @@ static void dump_transfer_function(FILE* fp, const char* name,
         fprintf(fp, " (D-gap: %.6g)", (n_at_d - l_at_d));
     }
 
+    fprintf(fp, " (f(1) = %.6g)", skcms_TransferFunction_eval(tf, 1.0f));
+
     skcms_Curve curve;
     curve.table_entries = 0;
     curve.parametric = *tf;
@@ -149,6 +196,7 @@ void dump_profile(const skcms_ICCProfile* profile, FILE* fp) {
     fprintf(fp, "%20s : 0x%08X : %u\n", "Size", profile->size, profile->size);
     dump_sig_field(fp, "Data color space", profile->data_color_space);
     dump_sig_field(fp, "PCS", profile->pcs);
+    fprintf(fp, "%20s :            : %d\n", "Input Channel Count", skcms_GetInputChannelCount(profile));
     fprintf(fp, "%20s : 0x%08X : %u\n", "Tag count", profile->tag_count, profile->tag_count);
 
     fprintf(fp, "\n");
@@ -185,6 +233,11 @@ void dump_profile(const skcms_ICCProfile* profile, FILE* fp) {
         skcms_TransferFunction inv;
         if (skcms_TransferFunction_invert(&best_single_curve.trc[0].parametric, &inv)) {
             dump_transfer_function(fp, "Inv ", &inv, 0.0f);
+
+            fprintf(fp, "Best Error: | %.6g %.6g %.6g |\n",
+                skcms_MaxRoundtripError(&profile->trc[0], &inv),
+                skcms_MaxRoundtripError(&profile->trc[1], &inv),
+                skcms_MaxRoundtripError(&profile->trc[2], &inv));
         } else {
             fprintf(fp, "*** could not invert Best ***\n");
         }
@@ -192,13 +245,21 @@ void dump_profile(const skcms_ICCProfile* profile, FILE* fp) {
 
     if (profile->has_toXYZD50) {
         skcms_Matrix3x3 toXYZ = profile->toXYZD50;
-        fprintf(fp, " XYZ : | %.9f %.9f %.9f |\n"
-                    "       | %.9f %.9f %.9f |\n"
-                    "       | %.9f %.9f %.9f |\n",
-               toXYZ.vals[0][0], toXYZ.vals[0][1], toXYZ.vals[0][2],
-               toXYZ.vals[1][0], toXYZ.vals[1][1], toXYZ.vals[1][2],
-               toXYZ.vals[2][0], toXYZ.vals[2][1], toXYZ.vals[2][2]);
 
+        fprintf(fp, " XYZ : | ");
+        print_shortest_float(fp, toXYZ.vals[0][0]); fprintf(fp, " ");
+        print_shortest_float(fp, toXYZ.vals[0][1]); fprintf(fp, " ");
+        print_shortest_float(fp, toXYZ.vals[0][2]); fprintf(fp, " |\n");
+
+        fprintf(fp, "       | ");
+        print_shortest_float(fp, toXYZ.vals[1][0]); fprintf(fp, " ");
+        print_shortest_float(fp, toXYZ.vals[1][1]); fprintf(fp, " ");
+        print_shortest_float(fp, toXYZ.vals[1][2]); fprintf(fp, " |\n");
+
+        fprintf(fp, "       | ");
+        print_shortest_float(fp, toXYZ.vals[2][0]); fprintf(fp, " ");
+        print_shortest_float(fp, toXYZ.vals[2][1]); fprintf(fp, " ");
+        print_shortest_float(fp, toXYZ.vals[2][2]); fprintf(fp, " |\n");
 
         float white_x = toXYZ.vals[0][0] + toXYZ.vals[0][1] + toXYZ.vals[0][2],
               white_y = toXYZ.vals[1][0] + toXYZ.vals[1][1] + toXYZ.vals[1][2],
@@ -213,8 +274,8 @@ void dump_profile(const skcms_ICCProfile* profile, FILE* fp) {
 
     if (profile->has_A2B) {
         const skcms_A2B* a2b = &profile->A2B;
-        fprintf(fp, " A2B : %s%s\"B\"\n", a2b->input_channels ? "\"A\", CLUT, " : "",
-                                          a2b->matrix_channels ? "\"M\", Matrix, " : "");
+        fprintf(fp, " A2B : %s%s\"B\"\n", a2b-> input_channels ? "\"A\", CLUT, "   : ""
+                                        , a2b->matrix_channels ? "\"M\", Matrix, " : "");
         if (a2b->input_channels) {
             fprintf(fp, "%4s : %u inputs\n", "\"A\"", a2b->input_channels);
             const char* curveNames[4] = { "A0", "A1", "A2", "A3" };
@@ -237,12 +298,21 @@ void dump_profile(const skcms_ICCProfile* profile, FILE* fp) {
                 dump_curve(fp, curveNames[i], &a2b->matrix_curves[i]);
             }
             const skcms_Matrix3x4* m = &a2b->matrix;
-            fprintf(fp, "Mtrx : | %.9f %.9f %.9f %.9f |\n"
-                        "       | %.9f %.9f %.9f %.9f |\n"
-                        "       | %.9f %.9f %.9f %.9f |\n",
-                   m->vals[0][0], m->vals[0][1], m->vals[0][2], m->vals[0][3],
-                   m->vals[1][0], m->vals[1][1], m->vals[1][2], m->vals[1][3],
-                   m->vals[2][0], m->vals[2][1], m->vals[2][2], m->vals[2][3]);
+            fprintf(fp, "Mtrx : | ");
+            print_shortest_float(fp, m->vals[0][0]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[0][1]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[0][2]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[0][3]); fprintf(fp, " |\n");
+            fprintf(fp, "       | ");
+            print_shortest_float(fp, m->vals[1][0]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[1][1]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[1][2]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[1][3]); fprintf(fp, " |\n");
+            fprintf(fp, "       | ");
+            print_shortest_float(fp, m->vals[2][0]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[2][1]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[2][2]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[2][3]); fprintf(fp, " |\n");
         }
 
         {
@@ -252,6 +322,91 @@ void dump_profile(const skcms_ICCProfile* profile, FILE* fp) {
                 dump_curve(fp, curveNames[i], &a2b->output_curves[i]);
             }
         }
+    }
+
+    if (profile->has_B2A) {
+        const skcms_B2A* b2a = &profile->B2A;
+        fprintf(fp, " B2A : \"B\"%s%s\n", b2a->matrix_channels ? ", Matrix, \"M\"" : ""
+                                        , b2a->output_channels ? ", CLUT, \"A\""   : "");
+
+        {
+            fprintf(fp, "%4s : %u inputs\n", "\"B\"", b2a->input_channels);
+            const char* curveNames[3] = { "B0", "B1", "B2" };
+            for (uint32_t i = 0; i < b2a->input_channels; ++i) {
+                dump_curve(fp, curveNames[i], &b2a->input_curves[i]);
+            }
+        }
+
+        if (b2a->matrix_channels) {
+            const skcms_Matrix3x4* m = &b2a->matrix;
+            fprintf(fp, "Mtrx : | ");
+            print_shortest_float(fp, m->vals[0][0]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[0][1]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[0][2]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[0][3]); fprintf(fp, " |\n");
+            fprintf(fp, "       | ");
+            print_shortest_float(fp, m->vals[1][0]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[1][1]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[1][2]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[1][3]); fprintf(fp, " |\n");
+            fprintf(fp, "       | ");
+            print_shortest_float(fp, m->vals[2][0]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[2][1]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[2][2]); fprintf(fp, " ");
+            print_shortest_float(fp, m->vals[2][3]); fprintf(fp, " |\n");
+            fprintf(fp, "%4s : %u inputs\n", "\"M\"", b2a->matrix_channels);
+            const char* curveNames[4] = { "M0", "M1", "M2" };
+            for (uint32_t i = 0; i < b2a->matrix_channels; ++i) {
+                dump_curve(fp, curveNames[i], &b2a->matrix_curves[i]);
+            }
+        }
+
+        if (b2a->output_channels) {
+            fprintf(fp, "%4s : ", "CLUT");
+            const char* sep = "";
+            for (uint32_t i = 0; i < b2a->input_channels; ++i) {
+                fprintf(fp, "%s%u", sep, b2a->grid_points[i]);
+                sep = " x ";
+            }
+            fprintf(fp, " (%d bpp)\n", b2a->grid_8 ? 8 : 16);
+            fprintf(fp, "%4s : %u outputs\n", "\"A\"", b2a->output_channels);
+            const char* curveNames[4] = { "A0", "A1", "A2", "A3" };
+            for (uint32_t i = 0; i < b2a->output_channels; ++i) {
+                dump_curve(fp, curveNames[i], &b2a->output_curves[i]);
+            }
+        }
+    }
+
+    skcms_Matrix3x3 chad;
+    if (skcms_GetCHAD(profile, &chad)) {
+        fprintf(fp, "CHAD : | ");
+        print_shortest_float(fp, chad.vals[0][0]); fprintf(fp, " ");
+        print_shortest_float(fp, chad.vals[0][1]); fprintf(fp, " ");
+        print_shortest_float(fp, chad.vals[0][2]); fprintf(fp, " |\n");
+
+        fprintf(fp, "       | ");
+        print_shortest_float(fp, chad.vals[1][0]); fprintf(fp, " ");
+        print_shortest_float(fp, chad.vals[1][1]); fprintf(fp, " ");
+        print_shortest_float(fp, chad.vals[1][2]); fprintf(fp, " |\n");
+
+        fprintf(fp, "       | ");
+        print_shortest_float(fp, chad.vals[2][0]); fprintf(fp, " ");
+        print_shortest_float(fp, chad.vals[2][1]); fprintf(fp, " ");
+        print_shortest_float(fp, chad.vals[2][2]); fprintf(fp, " |\n");
+    }
+
+    float wtpt[3];
+    if (skcms_GetWTPT(profile, wtpt)) {
+        fprintf(fp, "WTPT : | ");
+        print_shortest_float(fp, wtpt[0]); fprintf(fp, " ");
+        print_shortest_float(fp, wtpt[1]); fprintf(fp, " ");
+        print_shortest_float(fp, wtpt[2]); fprintf(fp, " |\n");
+    }
+
+    if (profile->has_CICP) {
+        fprintf(fp, "CICP : CP: %u TF: %u MC: %u FR: %u\n",
+                profile->CICP.color_primaries, profile->CICP.transfer_characteristics,
+                profile->CICP.matrix_coefficients, profile->CICP.video_full_range_flag);
     }
 
     dump_transform_to_XYZD50(fp, profile);

@@ -14,9 +14,9 @@
     #define SKCMS_NORETURN noreturn
 #endif
 
-#include "skcms.h"
-#include "skcms_internal.h"
 #include "test_only.h"
+#include "src/skcms_internals.h"
+#include "src/skcms_public.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -362,7 +362,7 @@ static void svg_transfer_function(FILE* fp, const skcms_TransferFunction* tf, co
             "points=\"\n", color);
 
     for (int i = 0; i < 256; ++i) {
-        float x = i / 255.0f;
+        float x = (float)i / 255.0f;
         float t = skcms_TransferFunction_eval(tf, x);
         fprintf(fp, "%g, %g\n", x, t);
     }
